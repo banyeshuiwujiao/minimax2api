@@ -66,7 +66,7 @@ def openai_to_anthropic(body: dict[str, Any], model: str) -> dict[str, Any]:
                         {
                             "type": "tool_result",
                             "tool_use_id": item.get("tool_call_id") or "",
-                            "content": _text_of(item.get("content")),
+                            "content": _tool_result_content(item.get("content")),
                         }
                     ],
                 }
@@ -137,11 +137,62 @@ def _convert_openai_message(item: dict[str, Any]) -> dict[str, Any] | None:
             if part.get("type") == "text":
                 blocks.append({"type": "text", "text": part.get("text", "")})
             elif part.get("type") == "image_url":
-                url = (part.get("image_url") or {}).get("url")
-                if url:
-                    blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+                image = _image_block((part.get("image_url") or {}).get("url") or "")
+                if image is not None:
+                    blocks.append(image)
         return {"role": "user", "content": blocks or [{"type": "text", "text": ""}]}
     return None
+
+
+def _image_block(url: str) -> dict[str, Any] | None:
+    """Convert one OpenAI image URL into an Anthropic image block.
+
+    A ``data:`` URL is unpacked into the canonical base64 source, which is the
+    shape the Anthropic Messages API documents.  A plain http(s) URL stays a
+    url source.  Either way the upstream receives something it can read: the
+    desktop client can only produce inline images, and dropping them would make
+    the model answer about a picture it never saw.
+    """
+    if not url:
+        return None
+    if url.startswith("data:"):
+        header, _, payload = url.partition(",")
+        if not payload:
+            return None
+        media_type = header[len("data:") :].split(";")[0] or "image/png"
+        if ";base64" not in header:
+            return None
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": payload},
+        }
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _tool_result_content(content: Any) -> Any:
+    """Build the content of an Anthropic ``tool_result`` block.
+
+    A tool result may carry an image -- ``read_image`` returns one -- and the
+    Anthropic ``tool_result`` block accepts image content.  Text-only results
+    keep the plain string form they always had; a result that carries an image
+    becomes a block list so the picture survives the conversion.
+    """
+    if not isinstance(content, list):
+        return _text_of(content)
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            blocks.append({"type": "text", "text": part.get("text", "")})
+        elif kind == "image_url":
+            image = _image_block((part.get("image_url") or {}).get("url") or "")
+            if image is not None:
+                blocks.append(image)
+    if not any(block["type"] == "image" for block in blocks):
+        return _text_of(content)
+    return blocks or ""
 
 
 def _convert_tools(tools: Any) -> list[dict[str, Any]]:

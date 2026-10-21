@@ -60,3 +60,42 @@ git checkout main          # 与上游一致，无补丁
 # 或者
 git checkout -b my-work main && git cherry-pick <patch-commit>
 ```
+
+---
+
+## 补丁 2：图片要活过 OpenAI → Anthropic 的转换（2026-10-21）
+
+桌面客户端用 **OpenAI Chat Completions** 方言跟这个反代说话，而它能产出的图片
+只有**内联**一种形态：内核给适配器一个持久附件引用，适配器把它变成 `data:` URL。
+于是转换这一层有两个洞：
+
+### 1. `data:` URL 被原样当成 url source 转发
+
+上游今天恰好收这种写法，但这不是 Anthropic Messages API 文档里的形状
+（内联图片的文档形状是 base64 source）。转换现在把 `data:` URL **拆开**，
+还原成规范的 base64 source：
+
+```python
+{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "…"}}
+```
+
+`http(s)` URL 仍然是 url source。畸形（没有 base64 载荷、没有逗号）的 `data:`
+URL 直接丢掉，而不是原样发给上游。
+
+### 2. 工具结果里的图片被丢掉了
+
+`read_image` 的结果是 `[文本信封, 图片块]`；工具结果那一支原来用 `_text_of`
+读内容，**只取文本**，图就没了。模型于是对着一个它从没见过的文件侃侃而谈，
+而且不报任何错。Anthropic 的 `tool_result` 本来就允许带 image 内容，
+所以带图的结果现在变成块列表；纯文本的结果**保持原来���字符串形状**，
+不改动已经在跑的工具调用链路。
+
+### 证据
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/ -q     # 109 passed（上游 97 + 本地 4 + 图片 8）
+```
+
+`tests/test_local_image_patch.py` 钉住这些行为：`data:` → base64 source、
+`http(s)` → url source、畸形 `data:` 被丢、工具结果带图被保留、纯文本工具结果
+仍是字符串。
