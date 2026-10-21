@@ -35,7 +35,7 @@ from typing import Any, Callable
 import httpx
 
 from . import signup
-from .records import REGION_GLOBAL
+from .records import REGION_GLOBAL, STATUS_INVALID
 
 # Refresh this long before the token dies.  The access token lives one hour and
 # the keeper sweeps every half hour, so the margin has to exceed the sweep
@@ -82,6 +82,23 @@ class RenewResult:
 def _is_transient(err: BaseException) -> bool:
     """Whether a failure is the network rather than the credential."""
     return isinstance(err, (httpx.TransportError, httpx.TimeoutException))
+
+
+def _log(message: str) -> None:
+    """Write one line to stdout without ever raising.
+
+    A backend whose stdout is gone -- the parent died, the log file was
+    rotated, a supervisor closed the stream -- must not turn every "report
+    what happened" into a crash.  ``print`` raises BrokenPipeError there, and a
+    raise inside the renewal path is indistinguishable from a failed renewal:
+    the request path reads it as "the credential is dead" and retires an
+    account whose token was in fact renewed a moment earlier.  That single
+    broken pipe is enough to empty the pool for an hour.
+    """
+    try:
+        print(message, flush=True)
+    except Exception:  # noqa: BLE001 - logging must never break the caller
+        pass
 
 
 async def refresh_with_token(
@@ -250,30 +267,25 @@ class Keeper:
                 item.cooldown_until = 0.0
 
             await self._db.update_account(account_id, apply)
-            print(
+            _log(
                 f"[keepalive] renewed {account.name or account_id} via {result.method}"
-                f" until {time.strftime('%H:%M:%S', time.localtime(result.expires_at))}",
-                flush=True,
+                f" until {time.strftime('%H:%M:%S', time.localtime(result.expires_at))}"
             )
         elif result.transient:
             # The credential was never judged — the network failed.  Leave the
             # account and its stored refresh token exactly as they were; the next
             # sweep will try again.  Writing a failure here is what makes a flaky
             # proxy look like a dead account.
-            print(
+            _log(
                 f"[keepalive] {account.name or account_id}: transport failure,"
-                f" will retry ({result.error})",
-                flush=True,
+                f" will retry ({result.error})"
             )
         else:
             def mark(item: Any) -> None:
                 item.last_error = f"renew failed: {result.error}"[:500]
 
             await self._db.update_account(account_id, mark)
-            print(
-                f"[keepalive] renew FAILED {account.name or account_id}: {result.error}",
-                flush=True,
-            )
+            _log(f"[keepalive] renew FAILED {account.name or account_id}: {result.error}")
         return result
 
     async def sweep(self) -> dict[str, Any]:
@@ -291,10 +303,19 @@ class Keeper:
         for account in await self._db.list_accounts():
             if account.kind != "oauth" or not account.enabled:
                 continue
-            if account.token_expires_at and account.token_expires_at - REFRESH_MARGIN_SEC > now:
-                continue
             if not account.refresh_token and not (account.email and account.password):
                 skipped += 1
+                continue
+            # A retired account gets a second chance here.  Retirement is meant
+            # to be a verdict on a credential that could not be renewed -- but
+            # the request path also retires an account whose renewal *raised*
+            # (a broken stdout pipe, a logging error), and such an account's
+            # token is perfectly fine.  Waiting for it to expire first means an
+            # hour of an empty pool, so a renewable retired account is renewed
+            # now: success resets the status, a genuine failure leaves it
+            # retired.
+            retired = account.status == STATUS_INVALID
+            if not retired and account.token_expires_at and account.token_expires_at - REFRESH_MARGIN_SEC > now:
                 continue
             due.append(account)
 
@@ -304,7 +325,7 @@ class Keeper:
                 result = await self.renew_account(account.id)
             except Exception as err:  # noqa: BLE001 - one account cannot kill the sweep
                 failed += 1
-                print(f"[keepalive] {account.name or account.id}: {err}", flush=True)
+                _log(f"[keepalive] {account.name or account.id}: {err}")
                 continue
             if result.ok:
                 renewed += 1
@@ -367,4 +388,4 @@ class Keeper:
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - the loop outlives one bad sweep
-                print(f"[keepalive] sweep error: {err}", flush=True)
+                _log(f"[keepalive] sweep error: {err}")

@@ -324,20 +324,28 @@ class Pool:
             # and a pool that empties itself every hour is the failure this
             # prevents.  Only if renewal fails is the credential treated as dead.
             if lease.account.kind == KIND_OAUTH and self.renewer is not None:
+                renewal_raised = False
                 try:
                     renewed = await self.renewer(lease.account.id)
                 except Exception:  # noqa: BLE001 - a failed renewal falls through
+                    # The renewal may well have succeeded and then failed on
+                    # something else -- a dead stdout pipe, a logging error --
+                    # and its account row is already updated.  Treating that as
+                    # "the credential is dead" retires a working account and
+                    # empties the pool, so an exception means "not judged".
                     renewed = None
+                    renewal_raised = True
                 if renewed is not None and getattr(renewed, "ok", False):
                     # The account row was rewritten by the renewer; pick it up so
                     # the next routing decision sees the fresh token.
                     await self.load()
                     return
-                if renewed is not None and getattr(renewed, "transient", False):
-                    # The renewal could not even reach the network.  That says
-                    # nothing about the credential, so the account is cooled like
-                    # a rate-limited one instead of retired: a proxy outage must
-                    # not empty the pool.
+                if renewal_raised or (renewed is not None and getattr(renewed, "transient", False)):
+                    # The credential was never judged: the renewal could not
+                    # even reach the network, or it raised on the way back.  That
+                    # says nothing about the credential, so the account is cooled
+                    # like a rate-limited one instead of retired: a proxy outage
+                    # must not empty the pool.
                     def cool_transient(account: Account) -> None:
                         routing = self._settings_fn().routing
                         steps = min(account.fail_count, _BACKOFF_STEPS)
